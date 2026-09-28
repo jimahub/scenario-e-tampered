@@ -1,0 +1,60 @@
+# 情境 E 對照組：攻擊者以「另一個 workflow 身分」重新簽章竄改後的 SBOM（2026-09-28，對應論文 ch4 §4.6.4）
+#
+# 目的：說明「驗證時鎖定簽章身分」是防禦成立的必要條件（情境 E 必做項目，2026-09-28 定案）。
+# 版本：Syft／Cosign 版本須與 devsecops.yml 相同（正式實驗前一併更新）。
+#   本 workflow 放在 scenario-e-tampered repository 的 .github/workflows/attacker-resign.yml，
+#   它的 OIDC 身分是 .../attacker-resign.yml@refs/heads/main，與 devsecops.yml 不同。
+#   產出的 SBOM 已被竄改，但帶有「合法的 Sigstore 簽章」。
+#
+# 下載 artifact 後在本機驗證兩次（見 scenario-guide-v2 情境 E 對照組）：
+#   1. --certificate-identity-regexp ".*"（舊設計）       → 預期 Verified OK（竄改未被發現）
+#   2. --certificate-identity 鎖定 devsecops.yml 的身分   → 預期失敗（身分不符）
+
+name: attacker-resign (scenario E control group)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  resign:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm ci
+      - name: Install Syft
+        run: curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin v1.42.4
+      - name: Generate SBOM
+        run: syft . -o cyclonedx-json=sbom.cdx.json
+      - name: Tamper SBOM
+        run: |
+          python3 - <<'EOF'
+          import json
+          p = 'sbom.cdx.json'
+          sbom = json.load(open(p, encoding='utf-8'))
+          n = 0
+          for c in sbom.get('components', []):
+              if c.get('name') == 'lodash' and c.get('version') == '4.17.4':
+                  c['version'] = '4.17.21'; n += 1
+                  if 'purl' in c:
+                      c['purl'] = c['purl'].replace('@4.17.4', '@4.17.21')
+          json.dump(sbom, open(p, 'w', encoding='utf-8'), indent=2)
+          print(f'tampered components: {n}')
+          assert n > 0, 'lodash@4.17.4 not found'
+          EOF
+      - uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: v3.0.6
+      - name: Re-sign tampered SBOM with this workflow's identity
+        run: cosign sign-blob --yes sbom.cdx.json --bundle sbom.bundle
+      - uses: actions/upload-artifact@v4
+        with:
+          name: attacker-signed
+          path: |
+            sbom.cdx.json
+            sbom.bundle

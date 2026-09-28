@@ -1,0 +1,228 @@
+# SBOM 驅動的自動化 DevSecOps 管線 — 參考 workflow（2026-09-28，對應論文 ch3 §3.3.2／§3.4.4 威脅模型）
+#
+# 設計重點（處理審查 #5）：
+#   1. 簽章端與驗證端分屬兩個 job，SBOM 經 artifact 傳遞，跨越一道信任邊界。
+#   2. 先驗證、後掃描：Grype 只掃描通過簽章驗證的 SBOM。
+#   3. 驗證時鎖定簽章身分（本 workflow 檔＋ref），不接受任意身分（不可用 regexp ".*"）。
+#   4. 驗證端 job 不持有 id-token 權限，無法以本 workflow 身分簽章。
+#   5. Policy Gate 在 enforce 模式下遇 BLOCK 以 exit 1 中止；效能實驗改用 record 模式（只記錄不中止），確保 metrics 完整上傳。
+#
+# 各情境 repository 只需修改 env.SCENARIO；情境 E 另插入 tamper job（見 scenario-e-tamper-job.yml）。
+# 尚待 smoke test 確認：cosign-installer@v3 可安裝 cosign v3.0.6；Syft／Grype 安裝腳本的版本參數。
+
+name: SBOM-driven DevSecOps pipeline
+
+on:
+  # 情境 repository 只接受手動觸發，於正式實驗凍結工具版本後執行（論文 §3.7.3、§4.6）
+  workflow_dispatch:
+
+env:
+  SCENARIO: 'Scenario E：SBOM 竄改'
+  # 以下三個版本為預測試版本；正式實驗前統一更新至當時最新穩定版並凍結（論文 §3.7.3）
+  SYFT_VERSION: v1.42.4
+  GRYPE_VERSION: v0.111.0
+  COSIGN_VERSION: v3.0.6
+  GATE_MODE: enforce          # enforce：BLOCK 時中止；record：只記錄（90 次效能實驗用）
+  EPSS_THRESHOLD: '0.1'
+  CVSS_CRITICAL: '9.0'
+
+jobs:
+  # ── 簽章端（Producer）：Stage 1–3 ──────────────────────────────────
+  build-and-sign:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write          # 只有簽章端能取得本 workflow 的 OIDC 身分
+    steps:
+      # Stage 1　環境初始化（步驟名稱與 baseline.yml 一致，方便以 REST API 擷取步驟時間）
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Install dependencies
+        run: npm ci
+
+      # Stage 2　SBOM 生成
+      - name: Install Syft
+        run: curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin "$SYFT_VERSION"
+      - name: Generate SBOM
+        run: |
+          START=$(date +%s%N)
+          syft . -o cyclonedx-json=sbom.cdx.json
+          END=$(date +%s%N)
+          SYFT_MS=$(( (END-START)/1000000 )) python3 -c "import json,os; d=json.load(open('sbom.cdx.json')); json.dump({'syft_ms': int(os.environ['SYFT_MS']), 'components': len(d.get('components', []))}, open('metrics-producer.json','w'))"
+
+      # Stage 3　SBOM 簽章
+      - uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: ${{ env.COSIGN_VERSION }}
+      - name: Sign SBOM
+        run: |
+          START=$(date +%s%N)
+          cosign sign-blob --yes sbom.cdx.json --bundle sbom.bundle
+          END=$(date +%s%N)
+          COSIGN_SIGN_MS=$(( (END-START)/1000000 )) python3 -c "import json,os; m=json.load(open('metrics-producer.json')); m['cosign_sign_ms']=int(os.environ['COSIGN_SIGN_MS']); json.dump(m,open('metrics-producer.json','w'))"
+
+      # 跨越信任邊界：SBOM 與簽章束經 artifact 傳給驗證端
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom-signed
+          path: |
+            sbom.cdx.json
+            sbom.bundle
+            metrics-producer.json
+
+  tamper:
+    needs: [ build-and-sign ]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read           # 無 id-token：無法以本 workflow 身分重新簽章
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: sbom-signed
+      - name: Tamper SBOM (simulated attack)
+        run: |
+          python3 - <<'EOF'
+          import json
+          p = 'sbom.cdx.json'
+          sbom = json.load(open(p, encoding='utf-8'))
+          n = 0
+          for c in sbom.get('components', []):
+              if c.get('name') == 'lodash' and c.get('version') == '4.17.4':
+                  c['version'] = '4.17.21'; n += 1
+                  # Grype 以 purl 比對套件，只改 version 不足以規避掃描，攻擊者會連 purl 一併改寫
+                  if 'purl' in c:
+                      c['purl'] = c['purl'].replace('@4.17.4', '@4.17.21')
+          json.dump(sbom, open(p, 'w', encoding='utf-8'), indent=2)
+          print(f'tampered components: {n}')
+          assert n > 0, 'lodash@4.17.4 not found; scenario E precondition failed'
+          EOF
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom-signed
+          overwrite: true      # 以竄改後的 SBOM 取代原 artifact（簽章束維持原樣）
+          path: |
+            sbom.cdx.json
+            sbom.bundle
+            metrics-producer.json
+
+  # ── 驗證端（Consumer）：Stage 4–7 ──────────────────────────────────
+  # 情境 E 的 repository 在此 job 前插入 tamper job，並將 needs 改為 [ tamper ]
+  verify-scan-gate:
+    needs: [ tamper ]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read           # 不給 id-token：驗證端無法以本 workflow 身分重新簽章
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: sbom-signed
+
+      # Stage 4　SBOM 完整性驗證（鎖定簽章身分）
+      - uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: ${{ env.COSIGN_VERSION }}
+      - name: Verify SBOM integrity
+        id: verify
+        run: |
+          START=$(date +%s%N)
+          cosign verify-blob sbom.cdx.json \
+            --bundle sbom.bundle \
+            --certificate-identity "https://github.com/${{ github.workflow_ref }}" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com"
+          END=$(date +%s%N)
+          echo "COSIGN_VERIFY_MS=$(( (END-START)/1000000 ))" >> "$GITHUB_ENV"
+
+      # Stage 5　漏洞掃描（只掃描已驗證的 SBOM）
+      - name: Install Grype
+        run: curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin "$GRYPE_VERSION"
+      - name: Scan vulnerabilities
+        id: scan
+        run: |
+          START=$(date +%s%N)
+          grype sbom:sbom.cdx.json -o json --file grype-results.json
+          END=$(date +%s%N)
+          echo "GRYPE_MS=$(( (END-START)/1000000 ))" >> "$GITHUB_ENV"
+
+      # Stage 6　Policy Gate（演算法 3.1）
+      - name: Policy Gate
+        id: gate
+        run: |
+          python3 - <<'EOF'
+          import json, os, sys
+          EPSS_T = float(os.environ['EPSS_THRESHOLD'])
+          CVSS_T = float(os.environ['CVSS_CRITICAL'])
+          report = json.load(open('grype-results.json'))
+          matches = report.get('matches', [])
+          block, warn, kev = [], [], []
+          critical = 0
+          for m in matches:
+              v = m.get('vulnerability', {})
+              if v.get('severity') == 'Critical':
+                  critical += 1
+              scores = [c.get('metrics', {}).get('baseScore', 0.0) for c in v.get('cvss', [])]
+              cvss = max(scores) if scores else 0.0
+              epss_list = v.get('epss', [])
+              epss = epss_list[0].get('epss', 0.0) if epss_list else 0.0
+              in_kev = bool(v.get('knownExploited', []))     # Grype v0.88.0+ 內建 KEV 欄位
+              if in_kev:                                     # 路徑①：KEV 覆蓋
+                  block.append(v.get('id')); kev.append(v.get('id'))
+              elif cvss >= CVSS_T and epss >= EPSS_T:        # 路徑②：Critical＋EPSS 高
+                  block.append(v.get('id'))
+              elif cvss >= CVSS_T:                           # 路徑③：Critical＋EPSS 低
+                  warn.append(v.get('id'))
+                                                             # 其他：路徑④ PASS
+          result = 'BLOCK' if block else ('WARN' if warn else 'PASS')
+          json.dump({'policy_gate': result, 'gate_mode': os.environ['GATE_MODE'],
+                     'total': len(matches), 'critical': critical,
+                     'block': len(block), 'warn': len(warn), 'kev': len(kev),
+                     'block_ids': block, 'warn_ids': warn, 'kev_ids': kev,
+                     'grype_ms': int(os.environ.get('GRYPE_MS', 0)),
+                     'cosign_verify_ms': int(os.environ.get('COSIGN_VERIFY_MS', 0))},
+                    open('metrics-consumer.json', 'w'), indent=2)
+          print(f'Policy Gate: {result}  BLOCK={len(block)} WARN={len(warn)} KEV={len(kev)}')
+          if result == 'BLOCK' and os.environ['GATE_MODE'] == 'enforce':
+              sys.exit(1)
+          EOF
+
+      # Stage 7　結果彙整與發布（驗證失敗或 BLOCK 時仍執行，保留稽核紀錄）
+      - name: Write Step Summary
+        if: always()
+        env:
+          VERIFY_OUTCOME: ${{ steps.verify.outcome }}
+          SCAN_OUTCOME: ${{ steps.scan.outcome }}
+          GATE_OUTCOME: ${{ steps.gate.outcome }}
+        run: |
+          python3 - <<'EOF' >> "$GITHUB_STEP_SUMMARY"
+          import json, os
+          def load(p):
+              try: return json.load(open(p))
+              except Exception: return {}
+          p, c = load('metrics-producer.json'), load('metrics-consumer.json')
+          mark = {'success': '✅', 'failure': '❌', 'skipped': '⏭️ skipped'}
+          o = lambda k: mark.get(os.environ.get(k, ''), os.environ.get(k, ''))
+          print(f"## SBOM 驅動的自動化安全管線 — {os.environ['SCENARIO']}")
+          print('| Stage | 結果 |')
+          print('|---|---|')
+          print(f"| Stage 2 SBOM 生成 | {p.get('components','—')} 個元件（{p.get('syft_ms','—')} ms） |")
+          print(f"| Stage 3 Cosign 簽章 | {p.get('cosign_sign_ms','—')} ms |")
+          print(f"| Stage 4 SBOM 完整性驗證 | {o('VERIFY_OUTCOME')} |")
+          print(f"| Stage 5 漏洞掃描 | {o('SCAN_OUTCOME')}；Total {c.get('total','—')}、Critical {c.get('critical','—')}（{c.get('grype_ms','—')} ms） |")
+          print(f"| KEV 命中 | {c.get('kev','—')} {', '.join(c.get('kev_ids', []))} |")
+          print(f"| **Stage 6 Policy Gate** | **{c.get('policy_gate','—')}**（BLOCK {c.get('block','—')}、WARN {c.get('warn','—')}；模式 {os.environ['GATE_MODE']}） |")
+          EOF
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pipeline-results
+          if-no-files-found: ignore
+          path: |
+            sbom.cdx.json
+            sbom.bundle
+            grype-results.json
+            metrics-producer.json
+            metrics-consumer.json
