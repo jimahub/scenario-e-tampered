@@ -8,7 +8,7 @@
 #   5. Policy Gate 在 enforce 模式下遇 BLOCK 以 exit 1 中止；效能實驗改用 record 模式（只記錄不中止），確保 metrics 完整上傳。
 #
 # 各情境 repository 只需修改 env.SCENARIO；情境 E 另插入 tamper job（見 scenario-e-tamper-job.yml）。
-# 尚待 smoke test 確認：cosign-installer@v3 可安裝 cosign v3.0.6；Syft／Grype 安裝腳本的版本參數。
+# 2026-09-28 smoke test 修正：cosign-installer 須用 v4（v3 不支援 Cosign v3.x）；npm ci 須加 --legacy-peer-deps。
 
 name: SBOM-driven DevSecOps pipeline
 
@@ -42,7 +42,7 @@ jobs:
         with:
           node-version: '20'
       - name: Install dependencies
-        run: npm ci
+        run: npm ci --legacy-peer-deps   # B／C 刻意植入的 redis 3.0.2 與 typeorm 的 peer 需求衝突；與 lockfile 產生方式一致
 
       # Stage 2　SBOM 生成
       - name: Install Syft
@@ -55,7 +55,7 @@ jobs:
           SYFT_MS=$(( (END-START)/1000000 )) python3 -c "import json,os; d=json.load(open('sbom.cdx.json')); json.dump({'syft_ms': int(os.environ['SYFT_MS']), 'components': len(d.get('components', []))}, open('metrics-producer.json','w'))"
 
       # Stage 3　SBOM 簽章
-      - uses: sigstore/cosign-installer@v3
+      - uses: sigstore/cosign-installer@v4
         with:
           cosign-release: ${{ env.COSIGN_VERSION }}
       - name: Sign SBOM
@@ -122,7 +122,7 @@ jobs:
           name: sbom-signed
 
       # Stage 4　SBOM 完整性驗證（鎖定簽章身分）
-      - uses: sigstore/cosign-installer@v3
+      - uses: sigstore/cosign-installer@v4
         with:
           cosign-release: ${{ env.COSIGN_VERSION }}
       - name: Verify SBOM integrity

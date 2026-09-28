@@ -26,7 +26,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
-      - run: npm ci
+      - run: npm ci --legacy-peer-deps
       - name: Install Syft
         run: curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin v1.42.4
       - name: Generate SBOM
@@ -47,7 +47,7 @@ jobs:
           print(f'tampered components: {n}')
           assert n > 0, 'lodash@4.17.4 not found'
           EOF
-      - uses: sigstore/cosign-installer@v3
+      - uses: sigstore/cosign-installer@v4
         with:
           cosign-release: v3.0.6
       - name: Re-sign tampered SBOM with this workflow's identity
