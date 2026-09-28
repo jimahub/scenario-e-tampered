@@ -30,7 +30,7 @@ jobs:
       - name: Install Syft
         run: curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin v1.42.4
       - name: Generate SBOM
-        run: syft . -o cyclonedx-json=sbom.cdx.json
+        run: syft scan file:package-lock.json -o cyclonedx-json=sbom.cdx.json
       - name: Tamper SBOM
         run: |
           python3 - <<'EOF'
