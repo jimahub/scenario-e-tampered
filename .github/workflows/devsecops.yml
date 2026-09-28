@@ -213,21 +213,31 @@ jobs:
           matches = report.get('matches', [])
           block, warn, kev = [], [], []
           critical = 0
+          def v3(entries):
+              return [c.get('metrics', {}).get('baseScore', 0.0) for c in entries if str(c.get('version', '')).startswith('3')]
           for m in matches:
               v = m.get('vulnerability', {})
+              related = m.get('relatedVulnerabilities', [])
               if v.get('severity') == 'Critical':
                   critical += 1
-              scores = [c.get('metrics', {}).get('baseScore', 0.0) for c in v.get('cvss', [])]
-              cvss = max(scores) if scores else 0.0
+              # 識別碼：Grype 常以 GHSA 回報，一併記錄對應的 CVE 編號
+              cves = [r['id'] for r in related if r.get('id', '').startswith('CVE-')]
+              vid = v.get('id', '')
+              label = vid if vid.startswith('CVE-') or not cves else f"{vid}/{cves[0]}"
+              # CVSS：優先採 NVD 的 v3.x base score（論文 §4.7.2），無則退回原記錄的 v3.x，再無則取任一版本
+              nvd = [s for r in related if 'nvd' in r.get('namespace', '') for s in v3(r.get('cvss', []))]
+              own = v3(v.get('cvss', []))
+              anyv = [c.get('metrics', {}).get('baseScore', 0.0) for c in v.get('cvss', [])]
+              cvss = max(nvd or own or anyv or [0.0])
               epss_list = v.get('epss', [])
               epss = epss_list[0].get('epss', 0.0) if epss_list else 0.0
               in_kev = bool(v.get('knownExploited', []))     # Grype v0.88.0+ 內建 KEV 欄位
               if in_kev:                                     # 路徑①：KEV 覆蓋
-                  block.append(v.get('id')); kev.append(v.get('id'))
+                  block.append(label); kev.append(label)
               elif cvss >= CVSS_T and epss >= EPSS_T:        # 路徑②：Critical＋EPSS 高
-                  block.append(v.get('id'))
+                  block.append(label)
               elif cvss >= CVSS_T:                           # 路徑③：Critical＋EPSS 低
-                  warn.append(v.get('id'))
+                  warn.append(label)
                                                              # 其他：路徑④ PASS
           result = 'BLOCK' if block else ('WARN' if warn else 'PASS')
           marks = dict(l.strip().split('=', 1) for l in open(os.path.join(os.environ['RUNNER_TEMP'], 'marks.env')) if '=' in l)
