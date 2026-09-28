@@ -1,36 +1,53 @@
-# SBOM 驅動的自動化 DevSecOps 管線 — 參考 workflow（對應論文 ch3 §3.3.2／§3.4.4／§3.9.2）
+# SBOM 驅動的自動化 DevSecOps 管線 — 參考 workflow（對應論文 ch3 §3.3.2／§3.4.4／§3.5／§3.9.2）
 #
 # 設計重點：
 #   1. 簽章端與驗證端分屬兩個 job，SBOM 經 artifact 傳遞，跨越一道信任邊界。
 #   2. 先驗證、後掃描：Grype 只掃描通過簽章驗證的 SBOM。
 #   3. 驗證時鎖定簽章身分（本 workflow 檔＋ref），不接受任意身分（不可用 regexp ".*"）。
 #   4. 驗證端 job 不持有 id-token 權限，無法以本 workflow 身分簽章。
-#   5. Policy Gate 在 enforce 模式下遇 BLOCK 以 exit 1 中止；效能實驗改用 record 模式（只記錄不中止）。
+#   5. Policy Gate 腳本與 EPSS／KEV 凍結快照由驗證端自行從 repository 取得（不經 artifact），
+#      否則能改寫 artifact 的攻擊者也能改寫判準。快照雜湊不符即判 FAIL。
+#   6. 先保存證據、最後才執行判定：Stage 7 上傳稽核資料後，「Enforce decision」才依判定讓 job 失敗。
+#   7. 模擬部署（enforce 模式才有）：PASS 直接執行；WARN 須經 warn-review Environment 的必要審核者核准；
+#      BLOCK／FAIL／驗證失敗時驗證端 job 失敗，兩個部署 job 均不執行。部署條件只看 Policy Gate 的判定，
+#      不看情境代號。
 #
-# 計時（2026-09-28 smoke test 後修訂）：GitHub REST API 的步驟時間只精確到秒，
-# 因此所有時間指標改在步驟內以毫秒計時（date +%s%N），寫入 metrics-*.json：
-#   - 無法包在 run 內的 action（checkout、upload／download-artifact）以前後「時間戳記步驟」計時；
-#   - Grype 拆成漏洞資料庫下載（t_grype_db_ms）與實際掃描（t_grype_scan_ms），以區分固定成本。
-# Syft 只掃描 package-lock.json（不掃整個目錄，避免把 workflow 用到的 GitHub Actions 與檔案當成元件）。
+# 計時：GitHub REST API 的步驟時間只精確到秒，所有時間指標在步驟內以毫秒計時（date +%s%N），寫入 metrics-*.json；
+#   無法包在 run 內的 action（checkout、upload／download-artifact）以前後「時間戳記步驟」計時；
+#   Grype 拆成漏洞資料庫下載（t_grype_db_ms）與實際掃描（t_grype_scan_ms）。
+# Syft 只掃描 package-lock.json。Grype 使用預設模式（不可加 --by-cve：Grype 0.111.0 的 --by-cve 會丟掉 NVD 紀錄）。
 #
-# 各情境 repository 只需修改 env.SCENARIO；情境 E 另插入 tamper job（見 scenario-e-tamper-job.yml）。
-# 2026-09-28 smoke test 修正：cosign-installer 須用 v4.1.2（v3 不支援 Cosign v3.x，且沒有 v4 浮動標籤）；npm ci 須加 --legacy-peer-deps。
+# 各 repository 只需修改 env 區的 SCENARIO 與情境判準（EXPECT／TARGET_*）；情境 E 另插入 tamper job（見 scenario-e-tamper-job.yml）。
+# 工具安裝：Syft／Grype 的 install.sh 取自對應版本標籤（非 main）；Cosign 直接下載 release 檔並比對官方 SHA-256。
 
 name: SBOM-driven DevSecOps pipeline
 
 on:
   # 情境 repository 只接受手動觸發，於正式實驗凍結工具版本後執行（論文 §3.7.3、§4.6）
   workflow_dispatch:
+    inputs:
+      tamper_mode:
+        description: 'semantic＝改 lodash 版本；byte＝檔末追加一個位元組'
+        type: choice
+        options: [ semantic, byte ]
+        default: semantic
 
 env:
   SCENARIO: 'Scenario E：SBOM 竄改'
-  # 以下三個版本為預測試版本；正式實驗前統一更新至當時最新穩定版並凍結（論文 §3.7.3）
+  # 以下版本為預測試版本；正式實驗前統一更新至當時最新穩定版並凍結（論文 §3.7.3），
+  # COSIGN_SHA256 取自該版 release 的 cosign_checksums.txt（cosign-linux-amd64 一列）
   SYFT_VERSION: v1.42.4
   GRYPE_VERSION: v0.111.0
   COSIGN_VERSION: v3.0.6
-  GATE_MODE: enforce          # enforce：BLOCK 時中止；record：只記錄（90 次效能實驗用）
+  COSIGN_SHA256: c956e5dfcac53d52bcf058360d579472f0c1d2d9b69f55209e256fe7783f4c74
+  GATE_MODE: enforce          # enforce：BLOCK／FAIL 時中止並控制模擬部署；record：只記錄（90 次效能實驗用）
   EPSS_THRESHOLD: '0.1'
   CVSS_CRITICAL: '9.0'
+  # 情境判準（§3.9.5；只供紀錄，不影響判定）。實驗專案留空。
+  EXPECT: ''                  # PASS／WARN／BLOCK
+  TARGET_CVE: ''              # 例：CVE-2019-10744
+  TARGET_REASON: ''           # 例：CVSS_EPSS_LOW、CVSS+EPSS、KEV
+  TARGET_PACKAGE: ''          # 例：lodash@4.17.4
 
 jobs:
   # ── 簽章端（Producer）：Stage 1–3 ──────────────────────────────────
@@ -62,7 +79,7 @@ jobs:
       - name: Install Syft
         run: |
           START=$(date +%s%N)
-          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin "$SYFT_VERSION"
+          curl -sSfL "https://raw.githubusercontent.com/anchore/syft/${SYFT_VERSION}/install.sh" | sh -s -- -b /usr/local/bin "$SYFT_VERSION"
           END=$(date +%s%N)
           echo "t_syft_install_ms=$(( (END-START)/1000000 ))" >> "$RUNNER_TEMP/marks.env"
       - name: Generate SBOM
@@ -73,10 +90,14 @@ jobs:
           echo "t_syft_ms=$(( (END-START)/1000000 ))" >> "$RUNNER_TEMP/marks.env"
 
       # Stage 3　SBOM 簽章
-      - name: Install Cosign
-        uses: sigstore/cosign-installer@v4.1.2   # 須寫完整版本號（無 v4 浮動標籤）
-        with:
-          cosign-release: ${{ env.COSIGN_VERSION }}
+      - name: Install Cosign (release binary + SHA-256)
+        run: |
+          START=$(date +%s%N)
+          curl -sSfL "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-amd64" -o /tmp/cosign
+          echo "${COSIGN_SHA256}  /tmp/cosign" | sha256sum -c -
+          sudo install -m 0755 /tmp/cosign /usr/local/bin/cosign
+          END=$(date +%s%N)
+          echo "t_cosign_install_ms=$(( (END-START)/1000000 ))" >> "$RUNNER_TEMP/marks.env"
       - name: Sign SBOM
         run: |
           START=$(date +%s%N)
@@ -119,21 +140,28 @@ jobs:
         with:
           name: sbom-signed
       - name: Tamper SBOM (simulated attack)
+        env:
+          TAMPER_MODE: ${{ inputs.tamper_mode || 'semantic' }}
         run: |
           python3 - <<'EOF'
-          import json
-          p = 'sbom.cdx.json'
-          sbom = json.load(open(p, encoding='utf-8'))
-          n = 0
-          for c in sbom.get('components', []):
-              if c.get('name') == 'lodash' and c.get('version') == '4.17.4':
-                  c['version'] = '4.17.21'; n += 1
-                  # Grype 以 purl 比對套件，只改 version 不足以規避掃描，攻擊者會連 purl 一併改寫
-                  if 'purl' in c:
-                      c['purl'] = c['purl'].replace('@4.17.4', '@4.17.21')
-          json.dump(sbom, open(p, 'w', encoding='utf-8'), indent=2)
-          print(f'tampered components: {n}')
-          assert n > 0, 'lodash@4.17.4 not found; scenario E precondition failed'
+          import json, os
+          p, mode = 'sbom.cdx.json', os.environ['TAMPER_MODE']
+          if mode == 'byte':
+              open(p, 'ab').write(b' ')
+              print('tamper_mode=byte: appended one space byte')
+          else:
+              sbom = json.load(open(p, encoding='utf-8'))
+              n = 0
+              for c in sbom.get('components', []):
+                  if c.get('name') == 'lodash' and c.get('version') == '4.17.4':
+                      c['version'] = '4.18.1'; n += 1
+                      # Grype 以 purl 比對套件，只改 version 不足以規避掃描，攻擊者會連 purl 一併改寫
+                      if 'purl' in c:
+                          c['purl'] = c['purl'].replace('@4.17.4', '@4.18.1')
+              json.dump(sbom, open(p, 'w', encoding='utf-8'), indent=2)
+              print(f'tamper_mode=semantic: tampered components: {n}')
+              assert n > 0, 'lodash@4.17.4 not found; scenario E precondition failed'
+          print(mode, file=open('tamper-mode.txt', 'w'))
           EOF
       - uses: actions/upload-artifact@v4
         with:
@@ -143,6 +171,8 @@ jobs:
             sbom.cdx.json
             sbom.bundle
             metrics-producer.json
+            upload_start.txt
+            tamper-mode.txt
 
   # ── 驗證端（Consumer）：Stage 4–7 ──────────────────────────────────
   # 情境 E 的 repository 在此 job 前插入 tamper job，並將 needs 改為 [ tamper ]
@@ -151,6 +181,9 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read           # 不給 id-token：驗證端無法以本 workflow 身分重新簽章
+    outputs:
+      decision: ${{ steps.gate.outputs.decision }}
+      gate_mode: ${{ env.GATE_MODE }}
     steps:
       - name: Mark before download
         run: echo "t_download_start=$(date +%s%N)" >> "$RUNNER_TEMP/marks.env"
@@ -161,26 +194,35 @@ jobs:
         run: echo "t_download_end=$(date +%s%N)" >> "$RUNNER_TEMP/marks.env"
 
       # Stage 4　SBOM 完整性驗證（鎖定簽章身分）
-      - name: Install Cosign
-        uses: sigstore/cosign-installer@v4.1.2   # 須寫完整版本號（無 v4 浮動標籤）
-        with:
-          cosign-release: ${{ env.COSIGN_VERSION }}
+      - name: Install Cosign (release binary + SHA-256)
+        run: |
+          START=$(date +%s%N)
+          curl -sSfL "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-amd64" -o /tmp/cosign
+          echo "${COSIGN_SHA256}  /tmp/cosign" | sha256sum -c -
+          sudo install -m 0755 /tmp/cosign /usr/local/bin/cosign
+          END=$(date +%s%N)
+          echo "t_cosign_install2_ms=$(( (END-START)/1000000 ))" >> "$RUNNER_TEMP/marks.env"
       - name: Verify SBOM integrity
         id: verify
         run: |
           START=$(date +%s%N)
+          set +e
           cosign verify-blob sbom.cdx.json \
             --bundle sbom.bundle \
             --certificate-identity "https://github.com/${{ github.workflow_ref }}" \
-            --certificate-oidc-issuer "https://token.actions.githubusercontent.com"
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" 2>&1 | tee verify.log
+          STATUS=${PIPESTATUS[0]}
+          set -e
           END=$(date +%s%N)
+          echo "$STATUS" > verify-exit.txt
           echo "t_cosign_verify_ms=$(( (END-START)/1000000 ))" >> "$RUNNER_TEMP/marks.env"
+          exit "$STATUS"
 
       # Stage 5　漏洞掃描（只掃描已驗證的 SBOM；資料庫下載與掃描分開計時）
       - name: Install Grype
         run: |
           START=$(date +%s%N)
-          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin "$GRYPE_VERSION"
+          curl -sSfL "https://raw.githubusercontent.com/anchore/grype/${GRYPE_VERSION}/install.sh" | sh -s -- -b /usr/local/bin "$GRYPE_VERSION"
           END=$(date +%s%N)
           echo "t_grype_install_ms=$(( (END-START)/1000000 ))" >> "$RUNNER_TEMP/marks.env"
       - name: Update Grype DB
@@ -196,69 +238,69 @@ jobs:
           GRYPE_DB_AUTO_UPDATE: 'false'
         run: |
           START=$(date +%s%N)
-          grype sbom:sbom.cdx.json -o json --file grype-results.json
+          grype sbom:sbom.cdx.json -o json --file grype-results.json   # 預設模式；勿加 --by-cve
           END=$(date +%s%N)
           echo "t_grype_scan_ms=$(( (END-START)/1000000 ))" >> "$RUNNER_TEMP/marks.env"
 
-      # Stage 6　Policy Gate（演算法 3.1）
+      # Stage 6　Policy Gate（演算法 3.1）：判定腳本與凍結快照取自 repository，不取自 artifact
+      - name: Mark before gate checkout
+        run: echo "t_gate_checkout_start=$(date +%s%N)" >> "$RUNNER_TEMP/marks.env"
+      - name: Checkout Policy Gate and frozen feeds
+        uses: actions/checkout@v4
+        with:
+          path: trusted
+          sparse-checkout: |
+            .github/scripts
+            feeds
+          sparse-checkout-cone-mode: false
+      - name: Mark after gate checkout
+        run: echo "t_gate_checkout_end=$(date +%s%N)" >> "$RUNNER_TEMP/marks.env"
       - name: Policy Gate
         id: gate
         run: |
+          START=$(date +%s%N)
+          ARGS=()
+          [ -n "$EXPECT" ] && ARGS+=(--expect "$EXPECT")
+          [ -n "$TARGET_CVE" ] && ARGS+=(--target-cve "$TARGET_CVE")
+          [ -n "$TARGET_REASON" ] && ARGS+=(--target-reason "$TARGET_REASON")
+          [ -n "$TARGET_PACKAGE" ] && ARGS+=(--target-package "$TARGET_PACKAGE")
+          DECISION=$(python3 trusted/.github/scripts/policy_gate.py grype-results.json \
+            --epss trusted/feeds/epss.csv.gz --kev trusted/feeds/kev.json --sums trusted/feeds/SHA256SUMS \
+            --out decision.json "${ARGS[@]}")
+          END=$(date +%s%N)
+          echo "t_policy_gate_ms=$(( (END-START)/1000000 ))" >> "$RUNNER_TEMP/marks.env"
+          echo "decision=$DECISION" >> "$GITHUB_OUTPUT"
+          echo "Policy Gate: $DECISION"
+          # 本步驟不因判定結果失敗：先完成 Stage 7 的證據保存，再由最後的 Enforce decision 執行判定
+      - name: Write consumer metrics
+        if: always()
+        run: |
           python3 - <<'EOF'
-          import json, os, sys, time
-          t0 = time.time_ns()
-          EPSS_T = float(os.environ['EPSS_THRESHOLD'])
-          CVSS_T = float(os.environ['CVSS_CRITICAL'])
-          report = json.load(open('grype-results.json'))
-          matches = report.get('matches', [])
-          block, warn, kev = [], [], []
-          critical = 0
-          def v3(entries):
-              return [c.get('metrics', {}).get('baseScore', 0.0) for c in entries if str(c.get('version', '')).startswith('3')]
-          for m in matches:
-              v = m.get('vulnerability', {})
-              related = m.get('relatedVulnerabilities', [])
-              if v.get('severity') == 'Critical':
-                  critical += 1
-              # 識別碼：Grype 常以 GHSA 回報，一併記錄對應的 CVE 編號
-              cves = [r['id'] for r in related if r.get('id', '').startswith('CVE-')]
-              vid = v.get('id', '')
-              label = vid if vid.startswith('CVE-') or not cves else f"{vid}/{cves[0]}"
-              # CVSS：優先採 NVD 的 v3.x base score（論文 §4.7.2），無則退回原記錄的 v3.x，再無則取任一版本
-              nvd = [s for r in related if 'nvd' in r.get('namespace', '') for s in v3(r.get('cvss', []))]
-              own = v3(v.get('cvss', []))
-              anyv = [c.get('metrics', {}).get('baseScore', 0.0) for c in v.get('cvss', [])]
-              cvss = max(nvd or own or anyv or [0.0])
-              epss_list = v.get('epss', [])
-              epss = epss_list[0].get('epss', 0.0) if epss_list else 0.0
-              in_kev = bool(v.get('knownExploited', []))     # Grype v0.88.0+ 內建 KEV 欄位
-              if in_kev:                                     # 路徑①：KEV 覆蓋
-                  block.append(label); kev.append(label)
-              elif cvss >= CVSS_T and epss >= EPSS_T:        # 路徑②：Critical＋EPSS 高
-                  block.append(label)
-              elif cvss >= CVSS_T:                           # 路徑③：Critical＋EPSS 低
-                  warn.append(label)
-                                                             # 其他：路徑④ PASS
-          result = 'BLOCK' if block else ('WARN' if warn else 'PASS')
+          import json, os
           marks = dict(l.strip().split('=', 1) for l in open(os.path.join(os.environ['RUNNER_TEMP'], 'marks.env')) if '=' in l)
           out = {k: int(v) for k, v in marks.items() if k.endswith('_ms')}
-          out['download_ms'] = (int(marks['t_download_end']) - int(marks['t_download_start'])) // 1_000_000
+          ms = lambda a, b: (int(marks[b]) - int(marks[a])) // 1_000_000 if a in marks and b in marks else None
+          out['download_ms'] = ms('t_download_start', 't_download_end')
+          out['gate_checkout_ms'] = ms('t_gate_checkout_start', 't_gate_checkout_end')
           try:
               # 上傳前到下載完成：含上傳、驗證端 job 等待與啟動、下載（跨 job 成本 T_xjob）
               out['xjob_ms'] = (int(marks['t_download_end']) - int(open('upload_start.txt').read().strip())) // 1_000_000
           except Exception:
               out['xjob_ms'] = None
-          out.update({'policy_gate': result, 'gate_mode': os.environ['GATE_MODE'],
-                      'total': len(matches), 'critical': critical,
-                      'block': len(block), 'warn': len(warn), 'kev': len(kev),
-                      'block_ids': block, 'warn_ids': warn, 'kev_ids': kev,
-                      'image_os': os.environ.get('ImageOS'), 'image_version': os.environ.get('ImageVersion'),
-                      'policy_gate_ms': (time.time_ns() - t0) // 1_000_000})
-          json.dump(out, open('metrics-consumer.json', 'w'), indent=2)
-          print(f'Policy Gate: {result}  BLOCK={len(block)} WARN={len(warn)} KEV={len(kev)}')
-          if result == 'BLOCK' and os.environ['GATE_MODE'] == 'enforce':
-              sys.exit(1)
+          try:
+              d = json.load(open('decision.json', encoding='utf-8'))
+          except Exception:
+              d = {'decision': None}
+          out.update({'policy_gate': d.get('decision'), 'gate_mode': os.environ['GATE_MODE'],
+                      'strategies': d.get('strategies'), 'total': d.get('total'),
+                      'block': len(d.get('block_ids') or []), 'warn': len(d.get('warn_ids') or []), 'kev': len(d.get('kev_ids') or []),
+                      'block_ids': d.get('block_ids'), 'warn_ids': d.get('warn_ids'), 'kev_ids': d.get('kev_ids'),
+                      'data_gaps': d.get('data_gaps'), 'fail_reason': d.get('reason'),
+                      'image_os': os.environ.get('ImageOS'), 'image_version': os.environ.get('ImageVersion')})
+          json.dump(out, open('metrics-consumer.json', 'w'), indent=2, ensure_ascii=False)
+          print(out)
           EOF
+          sha256sum sbom.cdx.json sbom.bundle grype-results.json trusted/feeds/* 2>/dev/null > inputs-sha256.txt || true
 
       # Stage 7　結果彙整與發布（驗證失敗或 BLOCK 時仍執行，保留稽核紀錄）
       - name: Write Step Summary
@@ -266,25 +308,32 @@ jobs:
         env:
           VERIFY_OUTCOME: ${{ steps.verify.outcome }}
           SCAN_OUTCOME: ${{ steps.scan.outcome }}
-          GATE_OUTCOME: ${{ steps.gate.outcome }}
         run: |
           python3 - <<'EOF' >> "$GITHUB_STEP_SUMMARY"
           import json, os
           def load(p):
-              try: return json.load(open(p))
+              try: return json.load(open(p, encoding='utf-8'))
               except Exception: return {}
-          p, c = load('metrics-producer.json'), load('metrics-consumer.json')
+          p, c, k = load('metrics-producer.json'), load('metrics-consumer.json'), load('scenario-check.json')
           mark = {'success': '✅', 'failure': '❌', 'skipped': '⏭️ skipped'}
-          o = lambda k: mark.get(os.environ.get(k, ''), os.environ.get(k, ''))
+          o = lambda x: mark.get(os.environ.get(x, ''), os.environ.get(x, ''))
           print(f"## SBOM 驅動的自動化安全管線 — {os.environ['SCENARIO']}")
           print('| Stage | 結果 |')
           print('|---|---|')
           print(f"| Stage 2 SBOM 生成 | {p.get('components','—')} 個元件（{p.get('t_syft_ms','—')} ms） |")
           print(f"| Stage 3 Cosign 簽章 | {p.get('t_cosign_sign_ms','—')} ms |")
           print(f"| Stage 4 SBOM 完整性驗證 | {o('VERIFY_OUTCOME')} |")
-          print(f"| Stage 5 漏洞掃描 | {o('SCAN_OUTCOME')}；Total {c.get('total','—')}、Critical {c.get('critical','—')}（DB {c.get('t_grype_db_ms','—')} ms＋掃描 {c.get('t_grype_scan_ms','—')} ms） |")
-          print(f"| KEV 命中 | {c.get('kev','—')} {', '.join(c.get('kev_ids', []))} |")
+          print(f"| Stage 5 漏洞掃描 | {o('SCAN_OUTCOME')}；{c.get('total','—')} 筆（DB {c.get('t_grype_db_ms','—')} ms＋掃描 {c.get('t_grype_scan_ms','—')} ms） |")
+          print(f"| KEV 命中 | {c.get('kev','—')} {', '.join(c.get('kev_ids') or [])} |")
+          print(f"| 資料缺值 | {c.get('data_gaps','—')} |")
           print(f"| **Stage 6 Policy Gate** | **{c.get('policy_gate','—')}**（BLOCK {c.get('block','—')}、WARN {c.get('warn','—')}；模式 {os.environ['GATE_MODE']}） |")
+          if c.get('strategies'):
+              s = c['strategies']
+              print(f"| 三策略（管線層級） | 純 CVSS {s.get('s1')}／雙因子 {s.get('s2')}／三因子 {s.get('s3')} |")
+          if c.get('fail_reason'):
+              print(f"| FAIL 原因 | {c['fail_reason']} |")
+          if k:
+              print(f"| 情境判準 | {'✅ 符合' if k.get('ok') else '❌ 不符'}：{json.dumps(k.get('checks'), ensure_ascii=False)} |")
           EOF
       - name: Upload results
         if: always()
@@ -295,7 +344,53 @@ jobs:
           path: |
             sbom.cdx.json
             sbom.bundle
+            verify.log
+            verify-exit.txt
             grype-results.json
             grype-db-status.txt
+            decision.json
+            scenario-check.json
+            inputs-sha256.txt
             metrics-producer.json
             metrics-consumer.json
+
+      # 證據已保存後才執行判定
+      - name: Enforce decision
+        if: always()
+        env:
+          VERIFY_OUTCOME: ${{ steps.verify.outcome }}
+          GATE_OUTCOME: ${{ steps.gate.outcome }}
+          DECISION: ${{ steps.gate.outputs.decision }}
+        run: |
+          echo "verify=$VERIFY_OUTCOME gate=$GATE_OUTCOME decision=${DECISION:-none} mode=$GATE_MODE"
+          # 任何模式：驗證失敗、判定步驟未完成或輸入異常（FAIL）都使 job 失敗
+          { [ "$VERIFY_OUTCOME" = success ] && [ "$GATE_OUTCOME" = success ]; } || exit 1
+          case "$DECISION" in PASS|WARN|BLOCK) ;; *) exit 1;; esac
+          # enforce 模式：BLOCK 中止（record 模式只記錄）
+          if [ "$GATE_MODE" = enforce ] && [ "$DECISION" = BLOCK ]; then exit 1; fi
+
+  # ── 模擬部署（隔離，不涉及任何實際環境；只在 enforce 模式執行） ──────────
+  deploy-simulate-pass:
+    needs: [ verify-scan-gate ]
+    if: needs.verify-scan-gate.outputs.gate_mode == 'enforce' && needs.verify-scan-gate.outputs.decision == 'PASS'
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - run: printf 'run_id=%s\npolicy=PASS\napproval=not-required\nsimulated=true\n' "$GITHUB_RUN_ID" > simulation.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: simulation-pass
+          path: simulation.txt
+
+  deploy-simulate-warn:
+    needs: [ verify-scan-gate ]
+    if: needs.verify-scan-gate.outputs.gate_mode == 'enforce' && needs.verify-scan-gate.outputs.decision == 'WARN'
+    environment: warn-review     # 必要審核者核准後才執行；核准紀錄保存在該 run 的 deployment 紀錄
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - run: printf 'run_id=%s\npolicy=WARN\napproval=required-reviewer\nsimulated=true\n' "$GITHUB_RUN_ID" > simulation.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: simulation-warn-approved
+          path: simulation.txt

@@ -28,7 +28,7 @@ jobs:
           node-version: '20'
       - run: npm ci --legacy-peer-deps
       - name: Install Syft
-        run: curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin v1.42.4
+        run: curl -sSfL https://raw.githubusercontent.com/anchore/syft/v1.42.4/install.sh | sh -s -- -b /usr/local/bin v1.42.4
       - name: Generate SBOM
         run: syft scan file:package-lock.json -o cyclonedx-json=sbom.cdx.json
       - name: Tamper SBOM
@@ -40,16 +40,18 @@ jobs:
           n = 0
           for c in sbom.get('components', []):
               if c.get('name') == 'lodash' and c.get('version') == '4.17.4':
-                  c['version'] = '4.17.21'; n += 1
+                  c['version'] = '4.18.1'; n += 1
                   if 'purl' in c:
-                      c['purl'] = c['purl'].replace('@4.17.4', '@4.17.21')
+                      c['purl'] = c['purl'].replace('@4.17.4', '@4.18.1')
           json.dump(sbom, open(p, 'w', encoding='utf-8'), indent=2)
           print(f'tampered components: {n}')
           assert n > 0, 'lodash@4.17.4 not found'
           EOF
-      - uses: sigstore/cosign-installer@v4.1.2   # 須寫完整版本號（無 v4 浮動標籤）
-        with:
-          cosign-release: v3.0.6
+      - name: Install Cosign (release binary + SHA-256)
+        run: |
+          curl -sSfL https://github.com/sigstore/cosign/releases/download/v3.0.6/cosign-linux-amd64 -o /tmp/cosign
+          echo "c956e5dfcac53d52bcf058360d579472f0c1d2d9b69f55209e256fe7783f4c74  /tmp/cosign" | sha256sum -c -
+          sudo install -m 0755 /tmp/cosign /usr/local/bin/cosign
       - name: Re-sign tampered SBOM with this workflow's identity
         run: cosign sign-blob --yes sbom.cdx.json --bundle sbom.bundle
       - uses: actions/upload-artifact@v4
