@@ -47,7 +47,7 @@ jobs:
           print(f'tampered components: {n}')
           assert n > 0, 'lodash@4.17.4 not found'
           EOF
-      - uses: sigstore/cosign-installer@v4
+      - uses: sigstore/cosign-installer@v4.1.2   # 須寫完整版本號（無 v4 浮動標籤）
         with:
           cosign-release: v3.0.6
       - name: Re-sign tampered SBOM with this workflow's identity

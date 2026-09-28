@@ -8,7 +8,7 @@
 #   5. Policy Gate 在 enforce 模式下遇 BLOCK 以 exit 1 中止；效能實驗改用 record 模式（只記錄不中止），確保 metrics 完整上傳。
 #
 # 各情境 repository 只需修改 env.SCENARIO；情境 E 另插入 tamper job（見 scenario-e-tamper-job.yml）。
-# 2026-09-28 smoke test 修正：cosign-installer 須用 v4（v3 不支援 Cosign v3.x）；npm ci 須加 --legacy-peer-deps。
+# 2026-09-28 smoke test 修正：cosign-installer 須用 v4.1.2（v3 不支援 Cosign v3.x，且沒有 v4 浮動標籤）；npm ci 須加 --legacy-peer-deps。
 
 name: SBOM-driven DevSecOps pipeline
 
@@ -55,7 +55,7 @@ jobs:
           SYFT_MS=$(( (END-START)/1000000 )) python3 -c "import json,os; d=json.load(open('sbom.cdx.json')); json.dump({'syft_ms': int(os.environ['SYFT_MS']), 'components': len(d.get('components', []))}, open('metrics-producer.json','w'))"
 
       # Stage 3　SBOM 簽章
-      - uses: sigstore/cosign-installer@v4
+      - uses: sigstore/cosign-installer@v4.1.2   # 須寫完整版本號（無 v4 浮動標籤）
         with:
           cosign-release: ${{ env.COSIGN_VERSION }}
       - name: Sign SBOM
@@ -122,7 +122,7 @@ jobs:
           name: sbom-signed
 
       # Stage 4　SBOM 完整性驗證（鎖定簽章身分）
-      - uses: sigstore/cosign-installer@v4
+      - uses: sigstore/cosign-installer@v4.1.2   # 須寫完整版本號（無 v4 浮動標籤）
         with:
           cosign-release: ${{ env.COSIGN_VERSION }}
       - name: Verify SBOM integrity
