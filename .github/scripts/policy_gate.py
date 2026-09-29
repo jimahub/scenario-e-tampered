@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Policy Gate（演算法 3.1）— 對應論文 ch3 §3.5、§3.7.3、§3.9.4（2026-09-28 修訂版）
+"""Policy Gate（演算法 3.1）— 對應論文 ch3 §3.5、§3.7.3、§3.9.1（2026-09-29 修訂版：新增例外清單）
 
 放在各實驗 repository 的 .github/scripts/policy_gate.py，由 devsecops.yml 的 Stage 6 呼叫；
 也可在本機對保存的 grype-results.json 重跑（RQ4 的閾值與 CVSS 來源敏感度分析）。
@@ -10,22 +10,28 @@
   feeds/epss.csv.gz    凍結的 FIRST EPSS 快照（全量）
   feeds/kev.json       凍結的 CISA KEV 目錄
   feeds/SHA256SUMS     上述兩檔的 SHA-256；不符即判 FAIL
+  .github/security/exceptions.json（選用）
+                       例外清單：經確認為誤判（false_positive）或經核可接受風險（risk_accepted）的漏洞，
+                       每筆須有識別碼、套件@版本、理由、核可者與到期日。有效例外不參與判定，另列於 excepted；
+                       過期者自動失效（照常判定）；檔案存在但格式錯誤判 FAIL。
+                       例外清單取自 repository（受版本控制與審查），不取自 artifact。
 
 判定（每筆漏洞，依序）
   KEV 命中                              → BLOCK（路徑①）
-  CVSS 缺值                             → WARN（無法判斷嚴重度，交人工）
-  CVSS ≥ 9.0 且 EPSS 缺值               → WARN（無法確認利用機率低，交人工）
+  CVSS 缺值                             → WARN（無法判斷嚴重度，不靜默放行）
+  CVSS ≥ 9.0 且 EPSS 缺值               → WARN（無法確認利用機率低，不靜默放行）
   CVSS ≥ 9.0 且 EPSS ≥ 閾值             → BLOCK（路徑②）
   CVSS ≥ 9.0                            → WARN（路徑③）
   其他                                  → PASS（路徑④）
 整份報告取最嚴重者（BLOCK > WARN > PASS）。
+WARN 與 PASS 均允許部署；判定只決定「能否部署」，所有漏洞（含 PASS）另由 remediation.py 依嚴重度排定修補期限。
 
 缺值原則：個別漏洞的資料缺值不得靜默放行（舊版把缺值當 0 分，屬 fail-open），
 也不讓整條管線因個別缺值而無法運作（全擋會使真實專案每次都失敗）；
 只有系統層級的輸入異常（掃描報告缺失或格式錯誤、快照缺失或雜湊不符）才判 FAIL。
 
 CVSS 來源：NVD 紀錄的 Primary v3.x → NVD 紀錄任一 v3.x → GHSA 紀錄 v3.x → 任一版本 → 缺值。
-另記錄 GHSA 的 v3.x 分數（cvss_ghsa），供 CVSS 來源敏感度分析（表 4.9g）。
+另記錄 GHSA 的 v3.x 分數（cvss_ghsa），供 CVSS 來源敏感度分析（表 4.13g）。
 """
 import argparse
 import csv
@@ -36,6 +42,7 @@ import json
 import os
 import re
 import sys
+from datetime import date, datetime, timezone
 
 CVE_RE = re.compile(r'^CVE-\d{4}-\d{4,}$')
 RANK = {'PASS': 0, 'WARN': 1, 'BLOCK': 2}
@@ -108,6 +115,44 @@ def load_kev(path):
         {'catalogVersion': d.get('catalogVersion'), 'dateReleased': d.get('dateReleased'), 'count': len(vulns)}
 
 
+EXC_TYPES = {'false_positive', 'risk_accepted'}
+EXC_FIELDS = ('id', 'package', 'type', 'justification', 'approved_by', 'expires')
+
+
+def load_exceptions(path, as_of):
+    """回傳 (有效例外, 已過期例外)。檔案存在但格式錯誤 → InputError（FAIL）。"""
+    if not path:
+        return [], []
+    try:
+        d = json.load(open(path, encoding='utf-8'))
+    except (OSError, ValueError) as e:
+        raise InputError(f'例外清單無法讀取：{e}')
+    items = d.get('exceptions') if isinstance(d, dict) else None
+    if not isinstance(items, list):
+        raise InputError('例外清單缺少 exceptions 陣列')
+    active, expired = [], []
+    for i, e in enumerate(items):
+        if not isinstance(e, dict) or any(not str(e.get(k, '')).strip() for k in EXC_FIELDS):
+            raise InputError(f'例外清單第 {i + 1} 筆缺少必要欄位（{"、".join(EXC_FIELDS)}）')
+        if e['type'] not in EXC_TYPES:
+            raise InputError(f'例外清單第 {i + 1} 筆 type 須為 false_positive 或 risk_accepted')
+        try:
+            exp = date.fromisoformat(e['expires'])
+        except ValueError:
+            raise InputError(f'例外清單第 {i + 1} 筆 expires 須為 YYYY-MM-DD')
+        (active if exp >= as_of else expired).append(e)
+    return active, expired
+
+
+def match_exception(f, active):
+    ids = set(f['cve_candidates']) | {f['reported_id']}
+    pkg = f'{f["package"]}@{f["version"]}'
+    for e in active:
+        if e['id'] in ids and e['package'] == pkg:
+            return {k: e[k] for k in EXC_FIELDS}
+    return None
+
+
 def scores(entries, version_prefix=None, kind=None):
     out = []
     for c in entries or []:
@@ -154,8 +199,10 @@ def overall(labels):
     return max(labels, key=RANK.get) if labels else 'PASS'
 
 
-def evaluate(grype_path, epss_path, kev_path, sums_path, epss_t=0.1, cvss_t=9.0):
+def evaluate(grype_path, epss_path, kev_path, sums_path, epss_t=0.1, cvss_t=9.0, exceptions_path=None, as_of=None):
+    as_of = as_of or datetime.now(timezone.utc).date()
     feed_sha = check_sums(sums_path, [epss_path, kev_path])
+    active_exc, expired_exc = load_exceptions(exceptions_path, as_of)
     epss_map, epss_meta = load_epss(epss_path)
     kev_set, kev_meta = load_kev(kev_path)
     try:
@@ -195,17 +242,22 @@ def evaluate(grype_path, epss_path, kev_path, sums_path, epss_t=0.1, cvss_t=9.0)
         for s in (1, 2, 3):
             f[f's{s}'], f[f's{s}_reason'] = classify(s, f['cvss'], f['epss'], f['kev'], epss_t, cvss_t)
         f['decision'], f['reason'] = f['s3'], f['s3_reason']
+        f['exception'] = match_exception(f, active_exc)
         findings.append(f)
 
     label = lambda f: f['cve'] or f['reported_id']
+    gated = [f for f in findings if not f['exception']]   # 有效例外不參與判定
     return {
-        'decision': overall([f['decision'] for f in findings]),
-        'strategies': {f's{s}': overall([f[f's{s}'] for f in findings]) for s in (1, 2, 3)},
+        'decision': overall([f['decision'] for f in gated]),
+        'strategies': {f's{s}': overall([f[f's{s}'] for f in gated]) for s in (1, 2, 3)},
         'thresholds': {'epss': epss_t, 'cvss': cvss_t},
         'total': len(findings),
-        'block_ids': [label(f) for f in findings if f['decision'] == 'BLOCK'],
-        'warn_ids': [label(f) for f in findings if f['decision'] == 'WARN'],
+        'block_ids': [label(f) for f in gated if f['decision'] == 'BLOCK'],
+        'warn_ids': [label(f) for f in gated if f['decision'] == 'WARN'],
         'kev_ids': [label(f) for f in findings if f['kev']],
+        'excepted_ids': [label(f) for f in findings if f['exception']],
+        'exceptions': {'as_of': as_of.isoformat(), 'active': len(active_exc),
+                       'expired': [f"{e['id']} {e['package']}（{e['expires']} 到期）" for e in expired_exc]},
         'data_gaps': {
             'cvss_missing': sum(f['cvss'] is None for f in findings),
             'epss_missing': sum(f['epss'] is None for f in findings),
@@ -219,7 +271,7 @@ def evaluate(grype_path, epss_path, kev_path, sums_path, epss_t=0.1, cvss_t=9.0)
 
 
 def scenario_check(result, expect, target_cve=None, target_reason=None, target_package=None):
-    """情境判準（§3.9.5）：
+    """情境判準（§3.9.1）：
     (1) 整份判定符合預期；(2) 目標 CVE 被偵測到，且判定與原因符合預期；
     (3) 歸因：使整份判定達到預期等級的漏洞全部來自植入套件（target_package，例 lodash@4.17.4），
         基底套件不得有任何漏洞達到該等級。植入套件本身的其他漏洞另行列出（例：lodash@4.17.4 同時含
@@ -229,9 +281,10 @@ def scenario_check(result, expect, target_cve=None, target_reason=None, target_p
         return {'ok': False, 'why': 'FAIL: ' + result.get('reason', '')}
     checks = {'decision': result['decision'] == expect}
     if target_cve:
-        hits = [f for f in result['findings'] if target_cve in f['cve_candidates']]
+        gated = [f for f in result['findings'] if not f.get('exception')]
+        hits = [f for f in gated if target_cve in f['cve_candidates']]
         in_pkg = lambda f: target_package and f'{f["package"]}@{f["version"]}' == target_package
-        causes = [f for f in result['findings'] if RANK[f['decision']] >= RANK[expect]]
+        causes = [f for f in gated if RANK[f['decision']] >= RANK[expect]]
         checks['target_found'] = bool(hits)
         checks['target_decision'] = any(f['decision'] == expect for f in hits)
         if target_reason:
@@ -257,6 +310,8 @@ def main():
     ap.add_argument('--sums', default='feeds/SHA256SUMS')
     ap.add_argument('--epss-threshold', type=float, default=float(os.environ.get('EPSS_THRESHOLD', '0.1')))
     ap.add_argument('--cvss-critical', type=float, default=float(os.environ.get('CVSS_CRITICAL', '9.0')))
+    ap.add_argument('--exceptions', help='例外清單 JSON（選用；指定但無法讀取或格式錯誤即 FAIL）')
+    ap.add_argument('--as-of', type=date.fromisoformat, help='例外到期判斷日（預設今日 UTC；重跑分析時指定以求可重現）')
     ap.add_argument('--out', default='decision.json')
     ap.add_argument('--expect', help='情境預期判定（PASS／WARN／BLOCK）')
     ap.add_argument('--target-cve')
@@ -265,7 +320,7 @@ def main():
     ap.add_argument('--check-out', default='scenario-check.json')
     a = ap.parse_args()
     try:
-        result = evaluate(a.grype_json, a.epss, a.kev, a.sums, a.epss_threshold, a.cvss_critical)
+        result = evaluate(a.grype_json, a.epss, a.kev, a.sums, a.epss_threshold, a.cvss_critical, a.exceptions, a.as_of)
     except InputError as e:
         result = {'decision': 'FAIL', 'reason': str(e), 'findings': []}
     json.dump(result, open(a.out, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
@@ -275,7 +330,8 @@ def main():
         print(f"Scenario check: {'OK' if chk['ok'] else 'NOT OK'} {json.dumps({k: v for k, v in chk.items() if k not in ('expect', 'ok')}, ensure_ascii=False)}", file=sys.stderr)
     gaps = result.get('data_gaps', {})
     print(f"Policy Gate: {result['decision']}  BLOCK={len(result.get('block_ids', []))} "
-          f"WARN={len(result.get('warn_ids', []))} KEV={len(result.get('kev_ids', []))} gaps={gaps}"
+          f"WARN={len(result.get('warn_ids', []))} KEV={len(result.get('kev_ids', []))} "
+          f"EXCEPTED={len(result.get('excepted_ids', []))} gaps={gaps}"
           + (f"  reason={result['reason']}" if result['decision'] == 'FAIL' else ''), file=sys.stderr)
     print(result['decision'])
 

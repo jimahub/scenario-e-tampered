@@ -1,0 +1,5 @@
+{
+  "_說明": "修補期限（天，自首次偵測日起算）。期限應由組織依其弱點管理政策訂定（ISO/IEC 27001:2022 A.8.8）；以下為本研究實驗 repository 使用的示例值，不代表建議值。unknown＝CVSS 與 Grype 嚴重度皆缺值時採用的等級。",
+  "days": { "KEV": 15, "Critical": 15, "High": 30, "Medium": 90, "Low": 180 },
+  "unknown": "High"
+}

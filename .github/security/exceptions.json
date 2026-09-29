@@ -1,0 +1,4 @@
+{
+  "_說明": "例外清單：僅限經確認為誤判（false_positive）或經核可接受風險（risk_accepted）的漏洞。每筆必填 id（CVE 或 GHSA）、package（名稱@版本）、type、justification、approved_by、expires（YYYY-MM-DD，到期自動失效）。變更須經 Pull Request 審查。實驗 repository 一律為空。",
+  "exceptions": []
+}

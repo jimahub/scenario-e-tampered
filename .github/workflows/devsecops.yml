@@ -1,4 +1,4 @@
-# SBOM 驅動的自動化 DevSecOps 管線 — 參考 workflow（對應論文 ch3 §3.3.2／§3.4.4／§3.5／§3.9.2）
+# SBOM 驅動的自動化 DevSecOps 管線 — 參考 workflow（對應論文 ch3 §3.3.2／§3.4.4／§3.5／§3.9.3）
 #
 # 設計重點：
 #   1. 簽章端與驗證端分屬兩個 job，SBOM 經 artifact 傳遞，跨越一道信任邊界。
@@ -8,9 +8,12 @@
 #   5. Policy Gate 腳本與 EPSS／KEV 凍結快照由驗證端自行從 repository 取得（不經 artifact），
 #      否則能改寫 artifact 的攻擊者也能改寫判準。快照雜湊不符即判 FAIL。
 #   6. 先保存證據、最後才執行判定：Stage 7 上傳稽核資料後，「Enforce decision」才依判定讓 job 失敗。
-#   7. 模擬部署（enforce 模式才有）：PASS 直接執行；WARN 須經 warn-review Environment 的必要審核者核准；
-#      BLOCK／FAIL／驗證失敗時驗證端 job 失敗，兩個部署 job 均不執行。部署條件只看 Policy Gate 的判定，
-#      不看情境代號。
+#   7. 全自動、無人工核准（2026-09-29）：PASS 與 WARN 均自動執行模擬部署；BLOCK／FAIL／驗證失敗時
+#      驗證端 job 失敗，模擬部署不執行。部署條件只看 Policy Gate 的判定，不看情境代號。
+#   8. 判定只決定「能否部署」；修補追蹤另行處理（enforce 模式）：所有未列入有效例外的漏洞（含 PASS）
+#      依 remediation-policy.json 排定修補期限並同步追蹤 Issue（remediation.py）。
+#      誤判或核可接受的風險寫入 .github/security/exceptions.json（須有理由、核可者、到期日），經 PR 審查；
+#      人只處理例外，不介入每次執行。
 #
 # 計時：GitHub REST API 的步驟時間只精確到秒，所有時間指標在步驟內以毫秒計時（date +%s%N），寫入 metrics-*.json；
 #   無法包在 run 內的 action（checkout、upload／download-artifact）以前後「時間戳記步驟」計時；
@@ -23,7 +26,7 @@
 name: SBOM-driven DevSecOps pipeline
 
 on:
-  # 情境 repository 只接受手動觸發，於正式實驗凍結工具版本後執行（論文 §3.7.3、§4.6）
+  # 情境 repository 只接受手動觸發，於正式實驗凍結工具版本後執行（論文 §3.7.3、§3.9.1、§4.2）
   workflow_dispatch:
     inputs:
       tamper_mode:
@@ -40,10 +43,10 @@ env:
   GRYPE_VERSION: v0.111.0
   COSIGN_VERSION: v3.0.6
   COSIGN_SHA256: c956e5dfcac53d52bcf058360d579472f0c1d2d9b69f55209e256fe7783f4c74
-  GATE_MODE: enforce          # enforce：BLOCK／FAIL 時中止並控制模擬部署；record：只記錄（90 次效能實驗用）
+  GATE_MODE: enforce          # enforce：BLOCK／FAIL 時中止、控制模擬部署並同步修補追蹤；record：只記錄（90 次受控執行用）
   EPSS_THRESHOLD: '0.1'
   CVSS_CRITICAL: '9.0'
-  # 情境判準（§3.9.5；只供紀錄，不影響判定）。實驗專案留空。
+  # 情境判準（§3.9.1；只供紀錄，不影響判定）。實驗專案留空。
   EXPECT: ''                  # PASS／WARN／BLOCK
   TARGET_CVE: ''              # 例：CVE-2019-10744
   TARGET_REASON: ''           # 例：CVSS_EPSS_LOW、CVSS+EPSS、KEV
@@ -181,6 +184,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read           # 不給 id-token：驗證端無法以本 workflow 身分重新簽章
+      issues: write            # 修補追蹤 Issue（enforce 模式）
     outputs:
       decision: ${{ steps.gate.outputs.decision }}
       gate_mode: ${{ env.GATE_MODE }}
@@ -251,6 +255,7 @@ jobs:
           path: trusted
           sparse-checkout: |
             .github/scripts
+            .github/security
             feeds
           sparse-checkout-cone-mode: false
       - name: Mark after gate checkout
@@ -266,12 +271,23 @@ jobs:
           [ -n "$TARGET_PACKAGE" ] && ARGS+=(--target-package "$TARGET_PACKAGE")
           DECISION=$(python3 trusted/.github/scripts/policy_gate.py grype-results.json \
             --epss trusted/feeds/epss.csv.gz --kev trusted/feeds/kev.json --sums trusted/feeds/SHA256SUMS \
+            --exceptions trusted/.github/security/exceptions.json \
             --out decision.json "${ARGS[@]}")
           END=$(date +%s%N)
           echo "t_policy_gate_ms=$(( (END-START)/1000000 ))" >> "$RUNNER_TEMP/marks.env"
           echo "decision=$DECISION" >> "$GITHUB_OUTPUT"
           echo "Policy Gate: $DECISION"
           # 本步驟不因判定結果失敗：先完成 Stage 7 的證據保存，再由最後的 Enforce decision 執行判定
+
+      # Stage 7a　修補追蹤（只在 enforce 模式；不計入 90 次受控執行的時間）
+      - name: Remediation tracking
+        if: env.GATE_MODE == 'enforce' && contains(fromJSON('["PASS","WARN","BLOCK"]'), steps.gate.outputs.decision)
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          python3 trusted/.github/scripts/remediation.py decision.json \
+            --policy trusted/.github/security/remediation-policy.json --out remediation-plan.json \
+            ${TARGET_PACKAGE:+--target-package "$TARGET_PACKAGE"} --create-issues
       - name: Write consumer metrics
         if: always()
         run: |
@@ -300,7 +316,7 @@ jobs:
           json.dump(out, open('metrics-consumer.json', 'w'), indent=2, ensure_ascii=False)
           print(out)
           EOF
-          sha256sum sbom.cdx.json sbom.bundle grype-results.json trusted/feeds/* 2>/dev/null > inputs-sha256.txt || true
+          sha256sum sbom.cdx.json sbom.bundle grype-results.json trusted/feeds/* trusted/.github/security/* 2>/dev/null > inputs-sha256.txt || true
 
       # Stage 7　結果彙整與發布（驗證失敗或 BLOCK 時仍執行，保留稽核紀錄）
       - name: Write Step Summary
@@ -315,6 +331,7 @@ jobs:
               try: return json.load(open(p, encoding='utf-8'))
               except Exception: return {}
           p, c, k = load('metrics-producer.json'), load('metrics-consumer.json'), load('scenario-check.json')
+          rp = load('remediation-plan.json')
           mark = {'success': '✅', 'failure': '❌', 'skipped': '⏭️ skipped'}
           o = lambda x: mark.get(os.environ.get(x, ''), os.environ.get(x, ''))
           print(f"## SBOM 驅動的自動化安全管線 — {os.environ['SCENARIO']}")
@@ -330,6 +347,13 @@ jobs:
           if c.get('strategies'):
               s = c['strategies']
               print(f"| 三策略（管線層級） | 純 CVSS {s.get('s1')}／雙因子 {s.get('s2')}／三因子 {s.get('s3')} |")
+          if rp:
+              iss = rp.get('issues') or {}
+              print(f"| 修補追蹤 | {rp.get('packages')} 個套件版本、{rp.get('vulns')} 筆漏洞 {rp.get('by_tier')}；"
+                    f"Issue 新建 {len(iss.get('created', []))}、既有 {len(iss.get('existing', []))}、關閉 {len(iss.get('closed', []))}"
+                    + (f"；目標套件已追蹤 {'✅' if rp.get('target_tracked') else '❌'}" if 'target_tracked' in rp else '') + ' |')
+          if rp.get('excepted_ids'):
+              print(f"| 有效例外（不參與判定） | {', '.join(rp['excepted_ids'])} |")
           if c.get('fail_reason'):
               print(f"| FAIL 原因 | {c['fail_reason']} |")
           if k:
@@ -350,6 +374,7 @@ jobs:
             grype-db-status.txt
             decision.json
             scenario-check.json
+            remediation-plan.json
             inputs-sha256.txt
             metrics-producer.json
             metrics-consumer.json
@@ -369,28 +394,17 @@ jobs:
           # enforce 模式：BLOCK 中止（record 模式只記錄）
           if [ "$GATE_MODE" = enforce ] && [ "$DECISION" = BLOCK ]; then exit 1; fi
 
-  # ── 模擬部署（隔離，不涉及任何實際環境；只在 enforce 模式執行） ──────────
-  deploy-simulate-pass:
+  # ── 模擬部署（隔離，不涉及任何實際環境；只在 enforce 模式執行；PASS 與 WARN 均自動執行，無人工核准） ──
+  deploy-simulate:
     needs: [ verify-scan-gate ]
-    if: needs.verify-scan-gate.outputs.gate_mode == 'enforce' && needs.verify-scan-gate.outputs.decision == 'PASS'
+    if: needs.verify-scan-gate.outputs.gate_mode == 'enforce' && contains(fromJSON('["PASS","WARN"]'), needs.verify-scan-gate.outputs.decision)
     runs-on: ubuntu-latest
     permissions: {}
+    env:
+      DECISION: ${{ needs.verify-scan-gate.outputs.decision }}
     steps:
-      - run: printf 'run_id=%s\npolicy=PASS\napproval=not-required\nsimulated=true\n' "$GITHUB_RUN_ID" > simulation.txt
+      - run: printf 'run_id=%s\npolicy=%s\napproval=not-required\nremediation=tracked-in-issues\nsimulated=true\n' "$GITHUB_RUN_ID" "$DECISION" > simulation.txt
       - uses: actions/upload-artifact@v4
         with:
-          name: simulation-pass
-          path: simulation.txt
-
-  deploy-simulate-warn:
-    needs: [ verify-scan-gate ]
-    if: needs.verify-scan-gate.outputs.gate_mode == 'enforce' && needs.verify-scan-gate.outputs.decision == 'WARN'
-    environment: warn-review     # 必要審核者核准後才執行；核准紀錄保存在該 run 的 deployment 紀錄
-    runs-on: ubuntu-latest
-    permissions: {}
-    steps:
-      - run: printf 'run_id=%s\npolicy=WARN\napproval=required-reviewer\nsimulated=true\n' "$GITHUB_RUN_ID" > simulation.txt
-      - uses: actions/upload-artifact@v4
-        with:
-          name: simulation-warn-approved
+          name: simulation-deploy
           path: simulation.txt
