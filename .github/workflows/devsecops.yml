@@ -43,7 +43,7 @@ env:
   GRYPE_VERSION: v0.111.0
   COSIGN_VERSION: v3.0.6
   COSIGN_SHA256: c956e5dfcac53d52bcf058360d579472f0c1d2d9b69f55209e256fe7783f4c74
-  GATE_MODE: enforce          # enforce：BLOCK／FAIL 時中止、控制模擬部署並同步修補追蹤；record：只記錄（90 次受控執行用）
+  GATE_MODE: enforce          # enforce：BLOCK／FAIL 時中止、控制模擬部署並同步修補追蹤；record：只記錄（受控執行用）
   EPSS_THRESHOLD: '0.1'
   CVSS_CRITICAL: '9.0'
   # 情境判準（§3.9.1；只供紀錄，不影響判定）。實驗專案留空。
@@ -279,7 +279,7 @@ jobs:
           echo "Policy Gate: $DECISION"
           # 本步驟不因判定結果失敗：先完成 Stage 7 的證據保存，再由最後的 Enforce decision 執行判定
 
-      # Stage 7a　修補追蹤（只在 enforce 模式；不計入 90 次受控執行的時間）
+      # Stage 7a　修補追蹤（只在 enforce 模式；不計入受控執行的時間）
       - name: Remediation tracking
         if: env.GATE_MODE == 'enforce' && contains(fromJSON('["PASS","WARN","BLOCK"]'), steps.gate.outputs.decision)
         env:
